@@ -1,0 +1,82 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "prometheus-harness"
+version = "0.1.0"
+description = "MCP-First, J-Lens-Anchored Agentic Harness — model-agnostic interpretability and safety runtime"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Prometheus Contributors" }
+]
+keywords = ["mcp", "j-lens", "agentic", "interpretability", "safety", "harness"]
+
+dependencies = [
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "torch>=2.1",
+    "transformers>=4.40",
+    "safetensors",
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "fastmcp>=0.1",
+    "httpx>=0.25",
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp>=1.20",
+    "structlog>=23.0",
+    "click>=8.1",
+    "rich>=13.0",
+    "pyyaml>=6.0",
+    "gitpython>=3.1",
+    "watchdog>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "pytest-cov>=4.0",
+    "ruff>=0.1",
+    "mypy>=1.5",
+]
+cloudflare = [
+    "wrangler>=3.0",
+]
+langfuse = [
+    "langfuse>=2.0",
+]
+full = [
+    "accelerate>=0.25",
+    "bitsandbytes>=0.41",
+    "datasets>=2.14",
+    "sentence-transformers>=2.2",
+    "pgvector>=0.2",
+    "neo4j>=5.0",
+    "langchain>=0.2",
+    "langchain-core>=0.2",
+]
+
+[project.scripts]
+prometheus = "prometheus.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["prometheus"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
