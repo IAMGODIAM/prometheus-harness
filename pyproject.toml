@@ -8,20 +8,19 @@ version = "0.1.0"
 description = "MCP-First, J-Lens-Anchored Agentic Harness — model-agnostic interpretability and safety runtime"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 authors = [
     { name = "Prometheus Contributors" }
 ]
 keywords = ["mcp", "j-lens", "agentic", "interpretability", "safety", "harness"]
 
+# Core runtime — enough to RUN the agent against a hosted (NVIDIA) or local-NIM
+# backend. The J-lens interpretability engine's heavy ML stack (torch/transformers/
+# numpy/scipy) is an OPTIONAL extra: `pip install -e '.[jlens]'`. This is the RIG
+# change that makes torch optional so Prometheus runs on a plain machine.
 dependencies = [
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
-    "torch>=2.1",
-    "transformers>=4.40",
-    "safetensors",
-    "numpy>=1.24",
-    "scipy>=1.11",
     "fastmcp>=0.1",
     "httpx>=0.25",
     "opentelemetry-api>=1.20",
@@ -36,6 +35,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# J-lens interpretability engine (fit/probe/watchlist/decompose + real J-lens gate).
+# Optional so the agent can run without a heavy ML install.
+jlens = [
+    "torch>=2.1",
+    "transformers>=4.40",
+    "safetensors",
+    "numpy>=1.24",
+    "scipy>=1.11",
+]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",

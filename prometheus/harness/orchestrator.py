@@ -123,11 +123,16 @@ class AgentLoop:
         llm_client: Any = None,
         tool_router: Any = None,
         hooks: dict[HookType, list[Hook]] | None = None,
+        tracer: Any = None,
+        logger: Any = None,
     ):
         self.context = context
         self.llm_client = llm_client
         self.tool_router = tool_router
         self.hooks: dict[HookType, list[Hook]] = hooks or {ht: [] for ht in HookType}
+        # RIG: optional observability, no-op when None (preserves existing tests).
+        self.tracer = tracer
+        self.logger = logger
         self._running = False
         self._paused = False
 
@@ -170,6 +175,8 @@ class AgentLoop:
             Final result dict with status, output, and metadata.
         """
         self._running = True
+        if self.tracer:
+            self.tracer.new_trace()
 
         # Session start hook
         await self._run_hooks(HookType.SESSION_START, {
@@ -201,6 +208,16 @@ class AgentLoop:
                 response = await self._call_llm()
                 if response is None:
                     break
+
+                # RIG: record the LLM generation span when tracing is wired
+                if self.tracer and isinstance(response, dict):
+                    _usage = response.get("usage", {}) or {}
+                    self.tracer.record_llm_call(
+                        model=getattr(self.llm_client, "model_id", "unknown"),
+                        input_tokens=_usage.get("input_tokens", 0),
+                        output_tokens=_usage.get("output_tokens", 0),
+                        duration_ms=0.0,
+                    )
 
                 # Parse response for tool calls or completion
                 tool_calls = self._parse_tool_calls(response)
@@ -235,7 +252,11 @@ class AgentLoop:
                     })
 
                     if not pre_result.allow:
-                        # Tool call denied
+                        # Tool call denied by a PreToolUse gate (dual-LLM / J-lens / authz)
+                        if self.logger:
+                            self.logger.authz_decision(
+                                tool_call.get("name", ""), "deny", pre_result.reason or ""
+                            )
                         tool_result = ToolResult(
                             tool_name=tool_call.get("name", ""),
                             success=False,
@@ -247,8 +268,21 @@ class AgentLoop:
                             self._running = False
                             break
                     else:
-                        # Execute tool
-                        tool_result = await self._execute_tool(tool_call)
+                        # Execute tool (traced + logged when observability is wired)
+                        if self.tracer:
+                            from prometheus.observability.tracing import SpanKind
+                            with self.tracer.span(
+                                f"tool.{tool_call.get('name', '')}", SpanKind.TOOL_CALL
+                            ):
+                                tool_result = await self._execute_tool(tool_call)
+                        else:
+                            tool_result = await self._execute_tool(tool_call)
+                        if self.logger:
+                            self.logger.tool_call(
+                                tool_call.get("name", ""),
+                                tool_result.duration_ms,
+                                tool_result.success,
+                            )
 
                     # PostToolUse hook
                     await self._run_hooks(HookType.POST_TOOL_USE, {
@@ -399,12 +433,19 @@ class Orchestrator:
         verifier: Any = None,
         authz_engine: Any = None,
         jlens_gate: Any = None,
+        dual_llm_gate: Any = None,
+        tracer: Any = None,
+        logger: Any = None,
     ):
         self.llm_client = llm_client
         self.tool_router = tool_router
         self.verifier = verifier
         self.authz_engine = authz_engine
         self.jlens_gate = jlens_gate
+        # RIG: dual-LLM taint gate + observability, wired into spawned agents.
+        self.dual_llm_gate = dual_llm_gate
+        self.tracer = tracer
+        self.obs_logger = logger
         self.agents: dict[str, AgentLoop] = {}
         self._global_hooks: dict[HookType, list[Hook]] = {ht: [] for ht in HookType}
         self._kill_switch = False
@@ -447,6 +488,10 @@ class Orchestrator:
         # Combine global hooks with any role-specific hooks
         hooks = {ht: list(self._global_hooks[ht]) for ht in HookType}
 
+        # RIG: Add dual-LLM taint gate as PreToolUse hook if available (deny-first)
+        if self.dual_llm_gate and role == AgentRole.ACTOR:
+            hooks[HookType.PRE_TOOL_USE].append(self.dual_llm_gate.check)
+
         # Add J-lens gate as PreToolUse hook if available
         if self.jlens_gate and role == AgentRole.ACTOR:
             hooks[HookType.PRE_TOOL_USE].append(self.jlens_gate.check)
@@ -460,6 +505,8 @@ class Orchestrator:
             llm_client=self.llm_client,
             tool_router=self.tool_router,
             hooks=hooks,
+            tracer=self.tracer,
+            logger=self.obs_logger,
         )
 
         self.agents[context.agent_id] = agent
@@ -470,6 +517,8 @@ class Orchestrator:
         task: str,
         tools: list[str] | None = None,
         verify: bool = True,
+        max_tool_calls: int = 50,
+        max_runtime_seconds: float = 300.0,
     ) -> dict[str, Any]:
         """Run a complete task with optional verification.
 
@@ -488,6 +537,8 @@ class Orchestrator:
         actor = await self.spawn_agent(
             role=AgentRole.ACTOR,
             tools=tools,
+            max_tool_calls=max_tool_calls,
+            max_runtime_seconds=max_runtime_seconds,
         )
 
         # Run the agent loop
@@ -519,5 +570,6 @@ class Orchestrator:
             "kill_switch": self._kill_switch,
             "has_verifier": self.verifier is not None,
             "has_jlens_gate": self.jlens_gate is not None,
+            "has_dual_llm_gate": self.dual_llm_gate is not None,
             "has_authz": self.authz_engine is not None,
         }
