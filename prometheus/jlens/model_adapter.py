@@ -245,17 +245,22 @@ class ModelAdapter:
                 bnb_4bit_compute_dtype=torch.bfloat16,
                 bnb_4bit_quant_type="nf4",
             )
+            model_kwargs["device_map"] = "auto"
         elif load_in_8bit:
             from transformers import BitsAndBytesConfig
             model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+            model_kwargs["device_map"] = "auto"
         else:
             if dtype is not None:
                 model_kwargs["torch_dtype"] = dtype
-            else:
-                model_kwargs["torch_dtype"] = "auto"
-
-        if not (load_in_4bit or load_in_8bit):
-            model_kwargs["device_map"] = device
+            # Prefer plain .to(device) so CPU installs don't require accelerate.
+            # device_map is only used when accelerate is available and device is multi-gpu-ish.
+            try:
+                import accelerate  # noqa: F401
+                if device not in ("cpu", "mps") and str(device) != "cpu":
+                    model_kwargs["device_map"] = device
+            except ImportError:
+                pass
 
         model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
@@ -266,5 +271,7 @@ class ModelAdapter:
             actual_device = next(model.parameters()).device
         else:
             actual_device = torch.device(device)
+            if "device_map" not in model_kwargs:
+                model = model.to(actual_device)
 
         return cls(model=model, tokenizer=tokenizer, device=actual_device)
