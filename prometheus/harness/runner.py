@@ -119,6 +119,9 @@ async def run_task(
         verify=run.verify,
         max_tool_calls=max_calls,
         max_runtime_seconds=run.max_runtime_seconds,
+        # Pass tier/effort for the primary agent
+        subagent_tier=None,  # Let orchestrator decide based on role
+        subagent_effort=None,
     )
 
     result["safety"] = {

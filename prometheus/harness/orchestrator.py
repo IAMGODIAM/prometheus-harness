@@ -7,6 +7,12 @@ DeerFlow 2.0, OpenAI Agents SDK, and Hermes Agent patterns:
 - Subagent context isolation
 - Programmatic tool calling (code-mode for token reduction)
 - Context folding/compaction with durable anchors
+
+P0 WAR ROOM REPLIT INTEGRATION:
+- Subagent pool with warm returns (subagent_pool.py)
+- Tier/effort-based provider factory (model_client.py)
+- Delegation-aware J-Lens gate (jlens_gate.py)
+- Composable delegation: specialists, tiers, warm return, dynamic effort
 """
 
 from __future__ import annotations
@@ -17,88 +23,30 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Awaitable
+from typing import Any, Callable, Awaitable, Optional
+
+from prometheus.harness.model_client import (
+    SubagentTier,
+    EffortLevel,
+    ProviderFactory,
+)
+from prometheus.harness.subagent_pool import (
+    SubagentPool,
+    SubagentSpec,
+    init_global_pool,
+    get_global_pool,
+)
+from prometheus.harness.types import (
+    HookType,
+    PermissionMode,
+    AgentRole,
+    HookResult,
+    AgentContext,
+    ToolResult,
+    Hook,
+)
 
 logger = logging.getLogger(__name__)
-
-
-class HookType(str, Enum):
-    PRE_TOOL_USE = "pre_tool_use"
-    POST_TOOL_USE = "post_tool_use"
-    PRE_COMPACT = "pre_compact"
-    USER_PROMPT_SUBMIT = "user_prompt_submit"
-    SESSION_START = "session_start"
-    SESSION_END = "session_end"
-    PRE_COMPLETION = "pre_completion"
-    POST_COMPLETION = "post_completion"
-
-
-class PermissionMode(str, Enum):
-    DEFAULT = "default"
-    ACCEPT_EDITS = "accept_edits"
-    PLAN = "plan"
-    BYPASS = "bypass_permissions"
-    AUTO = "auto"
-    DONT_ASK = "dont_ask"
-
-
-class AgentRole(str, Enum):
-    ORCHESTRATOR = "orchestrator"
-    ACTOR = "actor"
-    VERIFIER = "verifier"
-    ARBITER = "arbiter"
-    PLANNER = "planner"
-
-
-@dataclass
-class HookResult:
-    """Result from a hook execution."""
-    allow: bool = True
-    modified_args: dict[str, Any] | None = None
-    reason: str | None = None
-    escalate: bool = False
-
-
-@dataclass
-class AgentContext:
-    """Isolated context for a subagent."""
-    agent_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
-    role: AgentRole = AgentRole.ACTOR
-    parent_id: str | None = None
-    messages: list[dict[str, Any]] = field(default_factory=list)
-    tools_available: list[str] = field(default_factory=list)
-    permission_mode: PermissionMode = PermissionMode.DEFAULT
-    memory_blocks: dict[str, str] = field(default_factory=dict)
-    metadata: dict[str, Any] = field(default_factory=dict)
-    max_tool_calls: int = 50
-    max_runtime_seconds: float = 300.0
-    tool_calls_made: int = 0
-    start_time: float = field(default_factory=time.time)
-
-    @property
-    def elapsed_seconds(self) -> float:
-        return time.time() - self.start_time
-
-    @property
-    def budget_exhausted(self) -> bool:
-        return (
-            self.tool_calls_made >= self.max_tool_calls
-            or self.elapsed_seconds >= self.max_runtime_seconds
-        )
-
-
-@dataclass
-class ToolResult:
-    """Result from a tool execution."""
-    tool_name: str
-    success: bool
-    output: Any = None
-    error: str | None = None
-    duration_ms: float = 0.0
-    tokens_used: int = 0
-
-
-Hook = Callable[[dict[str, Any]], Awaitable[HookResult]]
 
 
 class AgentLoop:
@@ -244,12 +192,20 @@ class AgentLoop:
 
                 # Execute tool calls
                 for tool_call in tool_calls:
-                    # PreToolUse hook
-                    pre_result = await self._run_hooks(HookType.PRE_TOOL_USE, {
+                    # PreToolUse hook — include delegation context for J-Lens gate
+                    pre_data = {
                         "tool_name": tool_call.get("name"),
                         "arguments": tool_call.get("arguments", {}),
                         "context": self.context,
-                    })
+                    }
+                    # Add delegation context for J-Lens gate (P0)
+                    if self.context.subagent_tier:
+                        pre_data["delegation_context"] = True
+                        pre_data["subagent_tier"] = self.context.subagent_tier.value
+                        if self.context.subagent_effort:
+                            pre_data["subagent_effort"] = self.context.subagent_effort.value
+
+                    pre_result = await self._run_hooks(HookType.PRE_TOOL_USE, pre_data)
 
                     if not pre_result.allow:
                         # Tool call denied by a PreToolUse gate (dual-LLM / J-lens / authz)
@@ -295,7 +251,7 @@ class AgentLoop:
                     self.context.messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.get("id", ""),
-                        "name": tool_call.get("name", ""),
+                        "name": tool_call.get("name"),
                         "content": str(tool_result.output if tool_result.success else tool_result.error),
                     })
 
@@ -424,6 +380,12 @@ class Orchestrator:
     - Programmatic tool calling for token reduction
     - Durable context anchors for rewind
     - Kill switch and per-session pause
+
+    P0 WAR ROOM REPLIT INTEGRATION:
+    - Subagent pool with warm returns (subagent_pool.py)
+    - Tier/effort-based provider factory (model_client.py)
+    - Delegation-aware J-Lens gate (jlens_gate.py)
+    - Composable delegation: specialists, tiers, warm return, dynamic effort
     """
 
     def __init__(
@@ -436,19 +398,54 @@ class Orchestrator:
         dual_llm_gate: Any = None,
         tracer: Any = None,
         logger: Any = None,
+        # P0: Subagent pool configuration
+        subagent_pool_max_size: int = 20,
+        subagent_pool_ttl_by_tier: dict[str, int] | None = None,
     ):
         self.llm_client = llm_client
         self.tool_router = tool_router
         self.verifier = verifier
         self.authz_engine = authz_engine
         self.jlens_gate = jlens_gate
-        # RIG: dual-LLM taint gate + observability, wired into spawned agents.
         self.dual_llm_gate = dual_llm_gate
         self.tracer = tracer
         self.obs_logger = logger
         self.agents: dict[str, AgentLoop] = {}
         self._global_hooks: dict[HookType, list[Hook]] = {ht: [] for ht in HookType}
         self._kill_switch = False
+
+        # P0: Provider factory for tier/effort-based delegation
+        # If llm_client is provided, use it as the base provider for the factory
+        self.provider_factory = ProviderFactory()
+
+        # Store the base llm_client for fallback
+        self._base_llm_client = llm_client
+
+        # P0: Warm subagent pool
+        self.subagent_pool = SubagentPool(
+            max_size=subagent_pool_max_size,
+            ttl_by_tier=subagent_pool_ttl_by_tier,
+            provider_factory=self.provider_factory,
+            tool_router=tool_router,
+            authz_engine=authz_engine,
+            jlens_gate=jlens_gate,
+            dual_llm_gate=dual_llm_gate,
+            tracer=tracer,
+            logger=logger,
+        )
+
+        # Initialize global pool for cross-orchestrator access
+        init_global_pool(
+            max_size=subagent_pool_max_size,
+            ttl_by_tier=subagent_pool_ttl_by_tier,
+            provider_factory=self.provider_factory,
+            tool_router=tool_router,
+            authz_engine=authz_engine,
+            jlens_gate=jlens_gate,
+            dual_llm_gate=dual_llm_gate,
+            tracer=tracer,
+            logger=logger,
+        )
 
     def register_global_hook(self, hook_type: HookType, hook: Hook) -> None:
         """Register a hook that applies to all agents."""
@@ -462,20 +459,79 @@ class Orchestrator:
         parent_id: str | None = None,
         max_tool_calls: int = 50,
         max_runtime_seconds: float = 300.0,
+        # P0: Delegation parameters
+        subagent_tier: Optional[SubagentTier] = None,
+        subagent_effort: Optional[EffortLevel] = None,
+        specialization: str = "general",
+        briefing: str = "",
+        use_pool: bool = True,
     ) -> AgentLoop:
         """Spawn a new agent with isolated context.
 
         Args:
-            role: Agent role (actor, verifier, planner, etc.)
+            role: Agent role (actor, verifier, planner, explorer, reviewer, tester, designer)
             tools: Available tools for this agent.
             permission_mode: Permission mode for tool access.
             parent_id: Parent agent ID for context inheritance.
             max_tool_calls: Maximum tool calls before budget exhaustion.
             max_runtime_seconds: Maximum runtime.
+            subagent_tier: Compute tier for this subagent (P0).
+            subagent_effort: Reasoning effort level (P0).
+            specialization: Specialist type (explorer, reviewer, tester, designer, general).
+            briefing: Briefing context for warm pool matching.
+            use_pool: Whether to use warm subagent pool (P0).
 
         Returns:
             Configured AgentLoop instance.
         """
+        # Determine tier/effort from role if not specified
+        if subagent_tier is None:
+            if role in (AgentRole.EXPLORER, AgentRole.REVIEWER, AgentRole.TESTER):
+                subagent_tier = SubagentTier.STANDARD
+            elif role == AgentRole.DESIGNER:
+                subagent_tier = SubagentTier.LARGE
+            else:
+                subagent_tier = SubagentTier.STANDARD
+
+        if subagent_effort is None:
+            if role in (AgentRole.EXPLORER, AgentRole.REVIEWER):
+                subagent_effort = EffortLevel.LOW
+            elif role == AgentRole.TESTER:
+                subagent_effort = EffortLevel.MEDIUM
+            elif role == AgentRole.DESIGNER:
+                subagent_effort = EffortLevel.HIGH
+            else:
+                subagent_effort = EffortLevel.MEDIUM
+
+        # Try to get warm subagent from pool
+        if use_pool:
+            agent, is_warm = await self.subagent_pool.get_or_create(
+                tier=subagent_tier,
+                effort=subagent_effort,
+                specialization=specialization,
+                briefing=briefing,
+                tools=tools,
+                permission_mode=permission_mode,
+                parent_id=parent_id,
+                max_tool_calls=max_tool_calls,
+                max_runtime_seconds=max_runtime_seconds,
+            )
+            if is_warm:
+                logger.info(f"Warm subagent return: {specialization} ({subagent_tier}/{subagent_effort})")
+                # Update context with new parameters
+                agent.context.role = role
+                agent.context.parent_id = parent_id
+                agent.context.tools_available = tools or []
+                agent.context.permission_mode = permission_mode
+                agent.context.max_tool_calls = max_tool_calls
+                agent.context.max_runtime_seconds = max_runtime_seconds
+                agent.context.subagent_tier = subagent_tier
+                agent.context.subagent_effort = subagent_effort
+                agent.context.specialization = specialization
+                agent.context.briefing = briefing
+                return agent
+
+        # Cold start — create new agent (fallback or pool disabled)
         context = AgentContext(
             role=role,
             parent_id=parent_id,
@@ -483,6 +539,10 @@ class Orchestrator:
             permission_mode=permission_mode,
             max_tool_calls=max_tool_calls,
             max_runtime_seconds=max_runtime_seconds,
+            subagent_tier=subagent_tier,
+            subagent_effort=subagent_effort,
+            specialization=specialization,
+            briefing=briefing,
         )
 
         # Combine global hooks with any role-specific hooks
@@ -500,9 +560,13 @@ class Orchestrator:
         if self.authz_engine:
             hooks[HookType.PRE_TOOL_USE].append(self.authz_engine.check_permission)
 
+        # Use provided base llm_client if available (e.g., MockProvider in tests),
+        # otherwise build provider from tier/effort
+        provider = self._base_llm_client or self.provider_factory.build_from_tier_effort(subagent_tier, subagent_effort)
+
         agent = AgentLoop(
             context=context,
-            llm_client=self.llm_client,
+            llm_client=provider,
             tool_router=self.tool_router,
             hooks=hooks,
             tracer=self.tracer,
@@ -519,6 +583,9 @@ class Orchestrator:
         verify: bool = True,
         max_tool_calls: int = 50,
         max_runtime_seconds: float = 300.0,
+        # P0: Delegation parameters for top-level task
+        subagent_tier: Optional[SubagentTier] = None,
+        subagent_effort: Optional[EffortLevel] = None,
     ) -> dict[str, Any]:
         """Run a complete task with optional verification.
 
@@ -526,6 +593,10 @@ class Orchestrator:
             task: Task description / user message.
             tools: Available tools.
             verify: Whether to run async verification on completion.
+            max_tool_calls: Maximum tool calls before budget exhaustion.
+            max_runtime_seconds: Maximum runtime.
+            subagent_tier: Compute tier for primary agent (P0).
+            subagent_effort: Reasoning effort for primary agent (P0).
 
         Returns:
             Task result with verification status.
@@ -533,12 +604,16 @@ class Orchestrator:
         if self._kill_switch:
             return {"status": "killed", "output": "Global kill switch activated"}
 
-        # Spawn actor agent
+        # Spawn actor agent with tier/effort
         actor = await self.spawn_agent(
             role=AgentRole.ACTOR,
             tools=tools,
             max_tool_calls=max_tool_calls,
             max_runtime_seconds=max_runtime_seconds,
+            subagent_tier=subagent_tier,
+            subagent_effort=subagent_effort,
+            specialization="general",
+            briefing=task,  # Top-level task is the briefing
         )
 
         # Run the agent loop
@@ -556,14 +631,87 @@ class Orchestrator:
 
         return result
 
+    # P0: Delegation helpers
+    async def delegate_to_specialist(
+        self,
+        task: str,
+        specialist: AgentRole,
+        briefing: str,
+        tools: list[str] | None = None,
+        tier: Optional[SubagentTier] = None,
+        effort: Optional[EffortLevel] = None,
+        verify: bool = True,
+    ) -> dict[str, Any]:
+        """Delegate a task to a specialist subagent (P0 - War Room).
+
+        Args:
+            task: Task description.
+            specialist: Specialist role (EXPLORER, REVIEWER, TESTER, DESIGNER).
+            briefing: Detailed briefing for the specialist.
+            tools: Tools available to the specialist.
+            tier: Override default tier for this specialist.
+            effort: Override default effort for this specialist.
+            verify: Whether to verify the result.
+
+        Returns:
+            Specialist result with verification.
+        """
+        # Default tier/effort per specialist
+        defaults = {
+            AgentRole.EXPLORER: (SubagentTier.STANDARD, EffortLevel.LOW),
+            AgentRole.REVIEWER: (SubagentTier.STANDARD, EffortLevel.LOW),
+            AgentRole.TESTER: (SubagentTier.STANDARD, EffortLevel.MEDIUM),
+            AgentRole.DESIGNER: (SubagentTier.LARGE, EffortLevel.HIGH),
+        }
+        default_tier, default_effort = defaults.get(specialist, (SubagentTier.STANDARD, EffortLevel.MEDIUM))
+
+        specialist_agent = await self.spawn_agent(
+            role=specialist,
+            tools=tools,
+            briefing=briefing,
+            subagent_tier=tier or default_tier,
+            subagent_effort=effort or default_effort,
+            specialization=specialist.value,
+        )
+
+        result = await specialist_agent.run(initial_message=task)
+
+        if verify and result["status"] == "completion_claimed" and self.verifier:
+            verdict = await self.verifier.verify(result["output"])
+            result["verification"] = verdict
+
+        return result
+
+    async def run_delegated_task_graph(
+        self,
+        tasks: list[dict[str, Any]],
+        # Each task: {"task": str, "specialist": AgentRole, "briefing": str, "tools": [], "depends_on": []}
+    ) -> dict[str, Any]:
+        """Run a DAG of delegated specialist tasks (P1 - War Room).
+
+        Future: dependency resolution, parallel execution, result passing.
+        """
+        # Placeholder for P1 implementation
+        raise NotImplementedError("Delegated task graph coming in P1")
+
     def kill(self) -> None:
         """Activate global kill switch — stops all agents."""
         self._kill_switch = True
         for agent in self.agents.values():
             agent.stop()
 
+    async def shutdown(self) -> None:
+        """Shutdown orchestrator and subagent pool."""
+        self.kill()
+        await self.subagent_pool.shutdown()
+        # Also shutdown global pool
+        pool = get_global_pool()
+        if pool:
+            await pool.shutdown()
+
     def get_status(self) -> dict[str, Any]:
         """Get orchestrator status."""
+        pool_stats = self.subagent_pool.get_stats()
         return {
             "active_agents": len([a for a in self.agents.values() if a._running]),
             "total_agents_spawned": len(self.agents),
@@ -572,4 +720,5 @@ class Orchestrator:
             "has_jlens_gate": self.jlens_gate is not None,
             "has_dual_llm_gate": self.dual_llm_gate is not None,
             "has_authz": self.authz_engine is not None,
+            "subagent_pool": pool_stats,
         }
