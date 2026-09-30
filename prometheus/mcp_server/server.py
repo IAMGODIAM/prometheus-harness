@@ -543,6 +543,154 @@ def create_harness_server(harness: Any = None) -> Any:
     return server
 
 
+def create_orchestrator_server(use_mock: bool = True) -> Any:
+    """Create FastMCP server exposing Prometheus-OS orchestration (Sprint 4).
+
+    Tools (design: docs/MCP_HERMIE_SERVER_DESIGN_v0.1.md):
+    - prometheus_health
+    - prometheus_list_specialists
+    - prometheus_run_task
+    - prometheus_delegate_specialist
+    - prometheus_pool_metrics
+
+    Default use_mock=True for safe mesh-local smoke. Live providers require
+    PROMETHEUS_LLM_PROVIDER!=mock and NVIDIA_API_KEY.
+    """
+    try:
+        from fastmcp import FastMCP
+    except ImportError:
+        logger.warning("FastMCP not available")
+        return None
+
+    import os
+
+    from prometheus.authz.engine import AuthzEngine
+    from prometheus.harness.jlens_gate import load_jlens_gate
+    from prometheus.harness.model_client import (
+        EffortLevel,
+        MockProvider,
+        ProviderFactory,
+        SubagentTier,
+    )
+    from prometheus.harness.orchestrator import Orchestrator
+    from prometheus.harness.specialists.config import TOOL_ALLOWLISTS, SpecialistType
+    from prometheus.harness.subagent_pool import get_pool_metrics
+    from prometheus.harness.tools import SafeToolRouter as ToolRouter
+    from prometheus.harness.types import AgentRole
+
+    force_mock = use_mock or os.environ.get("PROMETHEUS_LLM_PROVIDER", "").lower() == "mock"
+    provider = MockProvider() if force_mock else ProviderFactory().build_from_env()
+    tool_router = ToolRouter()
+    authz_engine = AuthzEngine()
+    jlens_gate = load_jlens_gate(enable=False)
+    orchestrator = Orchestrator(
+        llm_client=provider,
+        tool_router=tool_router,
+        authz_engine=authz_engine,
+        jlens_gate=jlens_gate,
+        subagent_pool_max_size=20,
+    )
+
+    server = FastMCP(
+        name="prometheus-orchestrator",
+    )
+
+    @server.tool(
+        name="prometheus_health",
+        description="Health and mode of the Prometheus orchestrator MCP surface.",
+    )
+    async def prometheus_health() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "service": "prometheus-orchestrator",
+            "version": "0.2.0",
+            "mock": force_mock,
+            "provider": getattr(provider, "model_id", "unknown"),
+            "jlens_gate": "noop",
+            "bind_policy": "localhost_or_stdio_only",
+        }
+
+    @server.tool(
+        name="prometheus_list_specialists",
+        description="List specialist types, default tier/effort, and tool allowlists.",
+    )
+    async def prometheus_list_specialists() -> dict[str, Any]:
+        out = {}
+        for stype, tools in TOOL_ALLOWLISTS.items():
+            key = stype.value if hasattr(stype, "value") else str(stype)
+            out[key] = {"tools": list(tools)}
+        return {"specialists": out, "types": [t.value for t in SpecialistType]}
+
+    @server.tool(
+        name="prometheus_run_task",
+        description="Run a task through Orchestrator.run_task with tier/effort/budget controls.",
+    )
+    async def prometheus_run_task(
+        task: str,
+        tier: str = "standard",
+        effort: str = "medium",
+        max_tool_calls: int = 50,
+        max_cost_usd_cents: int = 500,
+        verify: bool = True,
+    ) -> dict[str, Any]:
+        result = await orchestrator.run_task(
+            task=task,
+            max_tool_calls=max_tool_calls,
+            max_cost_usd_cents=max_cost_usd_cents,
+            verify=verify,
+            subagent_tier=SubagentTier(tier) if isinstance(tier, str) else tier,
+            subagent_effort=EffortLevel(effort) if isinstance(effort, str) else effort,
+        )
+        # Ensure JSON-serializable
+        if isinstance(result, dict) and "output" in result and not isinstance(result["output"], (str, dict, list, type(None))):
+            result = {**result, "output": str(result["output"])}
+        return result
+
+    @server.tool(
+        name="prometheus_delegate_specialist",
+        description="Delegate to explorer|reviewer|tester|designer specialist.",
+    )
+    async def prometheus_delegate_specialist(
+        task: str,
+        specialist: str,
+        briefing: str = "",
+        tier: str | None = None,
+        effort: str | None = None,
+        max_cost_usd_cents: int = 500,
+        verify: bool = True,
+    ) -> dict[str, Any]:
+        role_map = {
+            "explorer": AgentRole.EXPLORER,
+            "reviewer": AgentRole.REVIEWER,
+            "tester": AgentRole.TESTER,
+            "designer": AgentRole.DESIGNER,
+        }
+        key = specialist.lower().strip()
+        if key not in role_map:
+            return {"status": "error", "error": f"Unknown specialist: {specialist}", "allowed": list(role_map)}
+        result = await orchestrator.delegate_to_specialist(
+            task=task,
+            specialist=role_map[key],
+            briefing=briefing or task,
+            tier=SubagentTier(tier) if tier else None,
+            effort=EffortLevel(effort) if effort else None,
+            max_cost_usd_cents=max_cost_usd_cents,
+            verify=verify,
+        )
+        if isinstance(result, dict) and "output" in result and not isinstance(result["output"], (str, dict, list, type(None))):
+            result = {**result, "output": str(result["output"])}
+        return result
+
+    @server.tool(
+        name="prometheus_pool_metrics",
+        description="Warm subagent pool metrics (hit rate, size, distributions).",
+    )
+    async def prometheus_pool_metrics() -> dict[str, Any]:
+        return get_pool_metrics()
+
+    return server
+
+
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 
