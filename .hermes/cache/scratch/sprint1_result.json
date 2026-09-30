@@ -1,0 +1,15 @@
+{
+  "files_created": [
+    "/home/user/src/prom/repo/prometheus/harness/specialists/__init__.py",
+    "/home/user/src/prom/repo/prometheus/harness/specialists/config.py",
+    "/home/user/src/prom/repo/prometheus/harness/specialists/explorer.py",
+    "/home/user/src/prom/repo/tests/test_specialists.py"
+  ],
+  "specialist_types_defined": [
+    "EXPLORER",
+    "REVIEWER",
+    "TESTER",
+    "DESIGNER"
+  ],
+  "tests_added": 16
+}
