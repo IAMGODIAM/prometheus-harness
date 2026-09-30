@@ -52,12 +52,12 @@ async def setup_pool():
 async def metrics_handler(request):
     """Handle /metrics endpoint - returns JSON metrics."""
     metrics = get_pool_metrics()
-    return web.json_response(metrics)
+    return web.json_response(metrics) if web else {"error": "aiohttp not available"}
 
 
 async def health_handler(request):
     """Handle /health endpoint."""
-    return web.json_response({"status": "healthy", "service": "warm-pool-metrics"})
+    return web.json_response({"status": "healthy", "service": "warm-pool-metrics"}) if web else {"error": "aiohttp not available"}
 
 
 async def prometheus_handler(request):
@@ -128,7 +128,7 @@ async def prometheus_handler(request):
         lines.append(f'warm_pool_specialization_subagents{{specialization="{spec}"}} {count}')
         lines.append("")
     
-    return web.Response(text="\n".join(lines), content_type="text/plain")
+    return web.Response(text="\n".join(lines), content_type="text/plain") if web else "\n".join(lines)
 
 
 async def main():
