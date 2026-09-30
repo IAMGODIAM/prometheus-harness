@@ -49,6 +49,87 @@ from prometheus.harness.types import (
 logger = logging.getLogger(__name__)
 
 
+class EffortEscalationHook:
+    """Hook that monitors task trajectory and escalates effort level mid-turn.
+
+    Tracks tool call patterns, failure rates, and context complexity to
+    dynamically increase reasoning effort when the agent is struggling.
+    """
+
+    def __init__(
+        self,
+        failure_threshold: float = 0.3,
+        complexity_threshold: int = 2000,
+        max_escalations: int = 2,
+    ):
+        self.failure_threshold = failure_threshold
+        self.complexity_threshold = complexity_threshold
+        self.max_escalations = max_escalations
+        self._escalation_count: dict[str, int] = {}
+
+    async def __call__(self, data: dict[str, Any]) -> HookResult:
+        """Evaluate whether to escalate effort based on context."""
+        context = data.get("context")
+        if not context:
+            return HookResult(allow=True)
+
+        agent_id = context.agent_id
+        current_effort = context.subagent_effort
+        current_tier = context.subagent_tier
+
+        # Count recent failures
+        tool_calls = context.tool_calls_made
+        recent_results = data.get("recent_results", [])
+        if recent_results:
+            failures = sum(1 for r in recent_results[-5:] if not r.get("success", True))
+            failure_rate = failures / len(recent_results[-5:])
+        else:
+            failure_rate = 0.0
+
+        # Check complexity (token count)
+        token_estimate = data.get("token_count", 0)
+
+        # Check if we should escalate
+        should_escalate = False
+        new_effort = current_effort
+        new_tier = current_tier
+
+        if failure_rate >= self.failure_threshold:
+            should_escalate = True
+        elif token_estimate >= self.complexity_threshold:
+            should_escalate = True
+
+        if should_escalate:
+            escalation_key = f"{agent_id}:{current_effort}:{current_tier}"
+            current_escalations = self._escalation_count.get(escalation_key, 0)
+
+            if current_escalations < self.max_escalations:
+                # Escalate effort level
+                if current_effort == EffortLevel.LOW:
+                    new_effort = EffortLevel.MEDIUM
+                elif current_effort == EffortLevel.MEDIUM:
+                    new_effort = EffortLevel.HIGH
+
+                # Also escalate tier if at HIGH effort
+                if new_effort == EffortLevel.HIGH and current_tier == SubagentTier.STANDARD:
+                    new_tier = SubagentTier.LARGE
+
+                self._escalation_count[escalation_key] = current_escalations + 1
+
+                return HookResult(
+                    allow=True,
+                    modified_args={
+                        "escalate_effort": True,
+                        "new_effort": new_effort,
+                        "new_tier": new_tier,
+                        "escalation_reason": f"failure_rate={failure_rate:.2f}, tokens={token_estimate}",
+                    },
+                    escalate=True,
+                )
+
+        return HookResult(allow=True)
+
+
 class AgentLoop:
     """Core agent loop implementing the think-act-observe cycle.
 
@@ -73,6 +154,7 @@ class AgentLoop:
         hooks: dict[HookType, list[Hook]] | None = None,
         tracer: Any = None,
         logger: Any = None,
+        provider_factory: Any = None,
     ):
         self.context = context
         self.llm_client = llm_client
@@ -83,6 +165,15 @@ class AgentLoop:
         self.logger = logger
         self._running = False
         self._paused = False
+        self._provider_factory = provider_factory
+
+        # Effort escalation state
+        self._effort_escalation_hook: EffortEscalationHook | None = None
+        for hook_list in self.hooks.values():
+            for hook in hook_list:
+                if isinstance(hook, EffortEscalationHook):
+                    self._effort_escalation_hook = hook
+                    break
 
     def register_hook(self, hook_type: HookType, hook: Hook) -> None:
         """Register a hook for a specific lifecycle event."""
@@ -151,6 +242,33 @@ class AgentLoop:
                     "messages": self.context.messages,
                     "token_count": self._estimate_tokens(),
                 })
+
+                # Effort escalation hook (pre-LLM call)
+                if self._effort_escalation_hook:
+                    recent_results = [tc for tc in result.get("tool_calls", [])]
+                    escalation_data = {
+                        "context": self.context,
+                        "recent_results": recent_results,
+                        "token_count": self._estimate_tokens(),
+                    }
+                    escalation_result = await self._effort_escalation_hook(escalation_data)
+                    if escalation_result.escalate and escalation_result.modified_args:
+                        # Apply effort escalation
+                        new_effort = escalation_result.modified_args.get("new_effort")
+                        new_tier = escalation_result.modified_args.get("new_tier")
+                        if new_effort:
+                            self.context.subagent_effort = new_effort
+                            # Rebuild LLM client with new effort
+                            if self._provider_factory:
+                                self.llm_client = self._provider_factory.build_from_tier_effort(
+                                    self.context.subagent_tier, new_effort
+                                )
+                        if new_tier:
+                            self.context.subagent_tier = new_tier
+                        if self.logger:
+                            self.logger.info(
+                                f"Effort escalated: {escalation_result.modified_args.get('escalation_reason')}"
+                            )
 
                 # Call LLM
                 response = await self._call_llm()
@@ -564,6 +682,10 @@ class Orchestrator:
         # otherwise build provider from tier/effort
         provider = self._base_llm_client or self.provider_factory.build_from_tier_effort(subagent_tier, subagent_effort)
 
+        # Add effort escalation hook
+        escalation_hook = EffortEscalationHook()
+        hooks[HookType.PRE_COMPACT].append(escalation_hook)
+
         agent = AgentLoop(
             context=context,
             llm_client=provider,
@@ -571,6 +693,7 @@ class Orchestrator:
             hooks=hooks,
             tracer=self.tracer,
             logger=self.obs_logger,
+            provider_factory=self.provider_factory,
         )
 
         self.agents[context.agent_id] = agent
@@ -586,6 +709,8 @@ class Orchestrator:
         # P0: Delegation parameters for top-level task
         subagent_tier: Optional[SubagentTier] = None,
         subagent_effort: Optional[EffortLevel] = None,
+        # Budget parameters
+        max_cost_usd_cents: int = 1000,  # $10 default
     ) -> dict[str, Any]:
         """Run a complete task with optional verification.
 
@@ -597,12 +722,18 @@ class Orchestrator:
             max_runtime_seconds: Maximum runtime.
             subagent_tier: Compute tier for primary agent (P0).
             subagent_effort: Reasoning effort for primary agent (P0).
+            max_cost_usd_cents: Maximum cost in USD cents for this task.
 
         Returns:
-            Task result with verification status.
+            Task result with verification status and cost tracking.
         """
         if self._kill_switch:
             return {"status": "killed", "output": "Global kill switch activated"}
+
+        # Set up delegation budget for the primary agent
+        if self.authz_engine:
+            # We'll set the budget after spawning the agent
+            pass
 
         # Spawn actor agent with tier/effort
         actor = await self.spawn_agent(
@@ -616,8 +747,17 @@ class Orchestrator:
             briefing=task,  # Top-level task is the briefing
         )
 
+        # Set up delegation budget for this agent
+        if self.authz_engine:
+            self.authz_engine.set_delegation_budget_limit(actor.context.agent_id, "max_cost_usd_cents", max_cost_usd_cents)
+            self.authz_engine.set_delegation_budget_limit(actor.context.agent_id, "max_tool_calls", max_tool_calls)
+
         # Run the agent loop
         result = await actor.run(initial_message=task)
+
+        # Add budget status to result
+        if self.authz_engine:
+            result["budget_status"] = self.authz_engine.get_delegation_budget_status(actor.context.agent_id)
 
         # Verify if completion claimed and verification enabled
         if verify and result["status"] == "completion_claimed" and self.verifier:
@@ -628,6 +768,8 @@ class Orchestrator:
                 # Retry with feedback
                 retry_msg = f"Verification failed. Issues: {verdict.get('failures', [])}. Please revise."
                 result = await actor.run(initial_message=retry_msg)
+                if self.authz_engine:
+                    result["budget_status"] = self.authz_engine.get_delegation_budget_status(actor.context.agent_id)
 
         return result
 
@@ -641,6 +783,7 @@ class Orchestrator:
         tier: Optional[SubagentTier] = None,
         effort: Optional[EffortLevel] = None,
         verify: bool = True,
+        max_cost_usd_cents: int = 500,  # $5 default for specialists
     ) -> dict[str, Any]:
         """Delegate a task to a specialist subagent (P0 - War Room).
 
@@ -648,13 +791,14 @@ class Orchestrator:
             task: Task description.
             specialist: Specialist role (EXPLORER, REVIEWER, TESTER, DESIGNER).
             briefing: Detailed briefing for the specialist.
-            tools: Tools available to the specialist.
+            tools: Tools available to the specialist. If None, uses specialist-specific allowlist.
             tier: Override default tier for this specialist.
             effort: Override default effort for this specialist.
             verify: Whether to verify the result.
+            max_cost_usd_cents: Maximum cost in USD cents for this delegation.
 
         Returns:
-            Specialist result with verification.
+            Specialist result with verification and budget status.
         """
         # Default tier/effort per specialist
         defaults = {
@@ -665,6 +809,22 @@ class Orchestrator:
         }
         default_tier, default_effort = defaults.get(specialist, (SubagentTier.STANDARD, EffortLevel.MEDIUM))
 
+        # If no tools specified, use specialist-specific allowlist
+        if tools is None:
+            from prometheus.harness.specialists.config import (
+                SpecialistType,
+                TOOL_ALLOWLISTS,
+            )
+            specialist_type_map = {
+                AgentRole.EXPLORER: SpecialistType.EXPLORER,
+                AgentRole.REVIEWER: SpecialistType.REVIEWER,
+                AgentRole.TESTER: SpecialistType.TESTER,
+                AgentRole.DESIGNER: SpecialistType.DESIGNER,
+            }
+            specialist_type = specialist_type_map.get(specialist)
+            if specialist_type:
+                tools = TOOL_ALLOWLISTS.get(specialist_type, [])
+
         specialist_agent = await self.spawn_agent(
             role=specialist,
             tools=tools,
@@ -674,7 +834,16 @@ class Orchestrator:
             specialization=specialist.value,
         )
 
+        # Set up delegation budget for this specialist
+        if self.authz_engine:
+            self.authz_engine.set_delegation_budget_limit(specialist_agent.context.agent_id, "max_cost_usd_cents", max_cost_usd_cents)
+            self.authz_engine.set_delegation_budget_limit(specialist_agent.context.agent_id, "max_tool_calls", 30)  # Lower limit for specialists
+
         result = await specialist_agent.run(initial_message=task)
+
+        # Add budget status to result
+        if self.authz_engine:
+            result["budget_status"] = self.authz_engine.get_delegation_budget_status(specialist_agent.context.agent_id)
 
         if verify and result["status"] == "completion_claimed" and self.verifier:
             verdict = await self.verifier.verify(result["output"])

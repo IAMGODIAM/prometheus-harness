@@ -127,6 +127,110 @@ class AuthzDecision:
     evaluation_time_ms: float = 0.0
 
 
+@dataclass
+class DelegationBudget:
+    """Per-subagent budget tracking for delegation cost accounting.
+
+    Tracks costs per subagent across categories (tool calls, compute, external calls, etc.)
+    with configurable limits and real-time enforcement.
+    """
+
+    subagent_id: str
+    limits: dict[str, int] = field(default_factory=lambda: {
+        "max_tool_calls": 50,
+        "max_compute_units": 1000,
+        "max_external_calls": 10,
+        "max_cost_usd_cents": 1000,  # $10 default
+    })
+    spent: dict[str, int] = field(default_factory=lambda: {
+        "max_tool_calls": 0,
+        "max_compute_units": 0,
+        "max_external_calls": 0,
+        "max_cost_usd_cents": 0,
+    })
+    category_spend: dict[str, dict[str, int]] = field(default_factory=dict)  # category -> {limit: spent}
+
+    def set_limit(self, limit_name: str, value: int) -> None:
+        """Set a budget limit."""
+        self.limits[limit_name] = value
+
+    def can_afford(self, costs: dict[str, int], category: str = "default") -> bool:
+        """Check if the budget can afford costs across all limits.
+        
+        Args:
+            costs: Dict mapping limit_name -> cost amount
+            category: Category for category-specific limits
+        """
+        # Check general limits
+        for limit_name, cost in costs.items():
+            limit_value = self.limits.get(limit_name)
+            if limit_value is None:
+                continue
+            spent_value = self.spent.get(limit_name, 0)
+            if spent_value + cost > limit_value:
+                return False
+
+        # Check category-specific limits
+        if category in self.category_spend:
+            cat_spend = self.category_spend[category]
+            for limit_name, cost in costs.items():
+                limit_value = self.limits.get(limit_name)
+                if limit_value is None:
+                    continue
+                spent_value = cat_spend.get(limit_name, 0)
+                if spent_value + cost > limit_value:
+                    return False
+
+        return True
+
+    def charge(self, costs: dict[str, int], category: str = "default") -> bool:
+        """Charge costs to the budget. Returns True if successful, False if would exceed limits.
+        
+        Args:
+            costs: Dict mapping limit_name -> cost amount
+            category: Category for category-specific tracking
+        """
+        if not self.can_afford(costs, category):
+            return False
+
+        # Charge to general limits
+        for limit_name, cost in costs.items():
+            if limit_name in self.limits:
+                self.spent[limit_name] = self.spent.get(limit_name, 0) + cost
+
+        # Charge to category-specific
+        if category not in self.category_spend:
+            self.category_spend[category] = {k: 0 for k in self.limits}
+        for limit_name, cost in costs.items():
+            if limit_name in self.limits:
+                self.category_spend[category][limit_name] = (
+                    self.category_spend[category].get(limit_name, 0) + cost
+                )
+
+        return True
+
+    def get_status(self) -> dict[str, Any]:
+        """Get current budget status."""
+        return {
+            "subagent_id": self.subagent_id,
+            "limits": self.limits,
+            "spent": self.spent,
+            "remaining": {
+                k: self.limits.get(k, 0) - self.spent.get(k, 0) for k in self.limits
+            },
+            "categories": {
+                cat: {
+                    k: self.category_spend[cat].get(k, 0) for k in self.limits
+                }
+                for cat in self.category_spend
+            },
+            "utilization": {
+                k: self.spent.get(k, 0) / self.limits.get(k, 1) if self.limits.get(k, 0) > 0 else 0
+                for k in self.limits
+            },
+        }
+
+
 class AuthzEngine:
     """Cedar-style authorization engine with deny-first semantics.
 
@@ -154,6 +258,9 @@ class AuthzEngine:
             "max_irreversible": 3,
         }
 
+        # Delegation budget tracking (P0 - War Room)
+        self._delegation_budgets: dict[str, "DelegationBudget"] = {}
+
     def add_policy(self, policy: Policy) -> None:
         """Add a policy to the engine."""
         self.policies.append(policy)
@@ -171,6 +278,34 @@ class AuthzEngine:
     def set_budget_limit(self, limit_name: str, value: int) -> None:
         """Set a budget limit."""
         self._budget_limits[limit_name] = value
+
+    # --- Delegation Budget Management ---
+
+    def get_delegation_budget(self, subagent_id: str) -> "DelegationBudget":
+        """Get or create a delegation budget for a subagent."""
+        if subagent_id not in self._delegation_budgets:
+            self._delegation_budgets[subagent_id] = DelegationBudget(subagent_id)
+        return self._delegation_budgets[subagent_id]
+
+    def set_delegation_budget_limit(self, subagent_id: str, limit_name: str, value: int) -> None:
+        """Set a budget limit for a specific subagent."""
+        budget = self.get_delegation_budget(subagent_id)
+        budget.set_limit(limit_name, value)
+
+    def check_delegation_budget(self, subagent_id: str, costs: dict[str, int]) -> bool:
+        """Check if a subagent can afford costs. Returns True if allowed."""
+        budget = self.get_delegation_budget(subagent_id)
+        return budget.can_afford(costs)
+
+    def charge_delegation_budget(self, subagent_id: str, costs: dict[str, int], category: str = "default") -> bool:
+        """Charge costs to a subagent's budget. Returns True if successful."""
+        budget = self.get_delegation_budget(subagent_id)
+        return budget.charge(costs, category)
+
+    def get_delegation_budget_status(self, subagent_id: str) -> dict[str, Any]:
+        """Get budget status for a subagent."""
+        budget = self.get_delegation_budget(subagent_id)
+        return budget.get_status()
 
     def evaluate(self, request: AuthzRequest) -> AuthzDecision:
         """Evaluate an authorization request against all policies.
@@ -270,7 +405,44 @@ class AuthzEngine:
         # Track budget
         self._increment_budget(request)
 
+        # Check delegation budget if this is a subagent
+        if context and context.subagent_tier:
+            agent_id = context.agent_id
+            # Estimate cost based on tool category
+            category = self._tool_categories.get(tool_name, ToolCategory.READ_ONLY)
+            base_cost = self._estimate_tool_cost(category)
+            
+            # Build costs dict for all limit types
+            costs = {
+                "max_tool_calls": 1,
+                "max_compute_units": base_cost,
+                "max_external_calls": base_cost if category == ToolCategory.EXTERNAL_VISIBLE else 0,
+                "max_cost_usd_cents": base_cost,
+            }
+            # Remove zero costs
+            costs = {k: v for k, v in costs.items() if v > 0}
+            
+            if not self.check_delegation_budget(agent_id, costs):
+                return HookResult(
+                    allow=False,
+                    reason=f"Delegation budget exhausted for {agent_id}",
+                    escalate=False,
+                )
+            
+            # Charge the delegation budget
+            self.charge_delegation_budget(agent_id, costs, category.value)
+
         return HookResult(allow=True)
+
+    def _estimate_tool_cost(self, category: ToolCategory) -> int:
+        """Estimate cost of a tool call based on its category."""
+        costs = {
+            ToolCategory.READ_ONLY: 1,
+            ToolCategory.REVERSIBLE: 2,
+            ToolCategory.EXTERNAL_VISIBLE: 5,
+            ToolCategory.IRREVERSIBLE: 10,
+        }
+        return costs.get(category, 1)
 
     def _check_budget(self, request: AuthzRequest) -> AuthzDecision | None:
         """Check if the request would exceed budget limits."""

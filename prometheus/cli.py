@@ -116,6 +116,11 @@ def main() -> None:
     run_parser.add_argument("--enable-jlens-gate", action="store_true", help="Enable J-lens gate (needs torch+fitted lens; else no-op).")
     run_parser.add_argument("--max-tool-calls", type=int, default=None, help="Override the tool-call budget.")
     run_parser.add_argument("--json", action="store_true", help="JSON output.")
+    # SPRINT 2: Dynamic effort + budget CLI flags
+    run_parser.add_argument("--tier", choices=["standard", "large"], default=None, help="Compute tier for primary agent.")
+    run_parser.add_argument("--effort", choices=["low", "medium", "high"], default=None, help="Reasoning effort level.")
+    run_parser.add_argument("--return-to", type=str, default=None, help="Return result to specific agent/context.")
+    run_parser.add_argument("--max-cost", type=int, default=None, help="Maximum cost in USD cents for this task.")
 
     args = parser.parse_args()
 
@@ -370,7 +375,10 @@ async def cmd_run(args: argparse.Namespace, config: HarnessConfig) -> None:
         build_provider_from_env,
         NVIDIA_DEFAULT_BASE_URL,
         DEFAULT_MODEL_ID,
+        SubagentTier,
+        EffortLevel,
     )
+    from prometheus.harness.orchestrator import Orchestrator
 
     if args.provider == "mock":
         provider = MockProvider()
@@ -392,10 +400,23 @@ async def cmd_run(args: argparse.Namespace, config: HarnessConfig) -> None:
         fs_root=args.fs_root,
     )
 
+    # Parse tier and effort from CLI args
+    subagent_tier = None
+    if args.tier:
+        subagent_tier = SubagentTier.STANDARD if args.tier == "standard" else SubagentTier.LARGE
+
+    subagent_effort = None
+    if args.effort:
+        effort_map = {"low": EffortLevel.LOW, "medium": EffortLevel.MEDIUM, "high": EffortLevel.HIGH}
+        subagent_effort = effort_map.get(args.effort)
+
+    max_cost_usd_cents = args.max_cost
+
     print(
         f"[prometheus run] provider={getattr(provider, 'model_id', '?')} "
         f"dry_run={rc.dry_run} allow_fs={rc.allow_fs} allow_net={rc.allow_net} "
         f"jlens_gate={'on' if rc.enable_jlens_gate else 'off'}"
+        f" tier={args.tier or 'auto'} effort={args.effort or 'auto'} max_cost={max_cost_usd_cents or 'default'}"
     )
     if not rc.dry_run:
         print(
@@ -404,7 +425,73 @@ async def cmd_run(args: argparse.Namespace, config: HarnessConfig) -> None:
         )
 
     try:
-        result = await run_task(args.task, config=config, provider=provider, run=rc)
+        # Use the orchestrator directly to access tier/effort/budget parameters
+        from prometheus.harness.tools import build_default_toolset
+        from prometheus.harness.verifier import AsyncVerifier
+        from prometheus.harness.dual_llm import DualLLMGate
+        from prometheus.authz.engine import AuthzEngine, Policy, PolicyEffect
+        from prometheus.harness.jlens_gate import load_jlens_gate
+        from prometheus.observability.tracing import Tracer
+        from prometheus.observability.logging import StructuredLogger
+
+        router = build_default_toolset(
+            dry_run=rc.dry_run,
+            allow_fs=rc.allow_fs,
+            allow_net=rc.allow_net,
+            fs_root=rc.fs_root,
+        )
+        provider.set_tool_specs(router.specs())
+
+        authz = AuthzEngine()
+        authz.load_default_policies()
+        for name, category in router.categories().items():
+            authz.classify_tool(name, category)
+        authz.set_budget_limit("max_tool_calls", config.authz.max_tool_calls)
+        authz.set_budget_limit("max_external_calls", config.authz.max_external_calls)
+        authz.set_budget_limit("max_irreversible", config.authz.max_irreversible)
+        if rc.allow_net:
+            authz.add_policy(Policy(
+                id="rig_permit_external_optin",
+                effect=PolicyEffect.PERMIT,
+                principal={"role": "actor"},
+                action={"category": "external_visible"},
+                description="Operator opted into network tools (--allow-net)",
+                priority=20,
+            ))
+
+        dual = DualLLMGate(strict_mode=True)
+        for name, taint in router.taints().items():
+            dual.declare_tool_taint(name, taint)
+
+        verifier = AsyncVerifier(verifier_llm_client=provider)
+
+        tracer = Tracer(service_name="prometheus")
+        slog = StructuredLogger(name="prometheus.run", json_output=config.observability.json_logs)
+
+        jlens_gate = load_jlens_gate(config, enable=rc.enable_jlens_gate)
+
+        orch = Orchestrator(
+            llm_client=provider,
+            tool_router=router,
+            verifier=verifier,
+            authz_engine=authz,
+            jlens_gate=jlens_gate,
+            dual_llm_gate=dual,
+            tracer=tracer,
+            logger=slog,
+        )
+
+        max_calls = rc.max_tool_calls or config.authz.max_tool_calls
+        result = await orch.run_task(
+            args.task,
+            tools=router.names(),
+            verify=rc.verify,
+            max_tool_calls=max_calls,
+            max_runtime_seconds=rc.max_runtime_seconds,
+            subagent_tier=subagent_tier,
+            subagent_effort=subagent_effort,
+            max_cost_usd_cents=max_cost_usd_cents or 1000,
+        )
     except RuntimeError as e:
         print(f"ERROR: {e}")
         sys.exit(2)

@@ -356,6 +356,64 @@ class SubagentPool:
         }
 
 
+    def get_metrics_endpoint(self) -> dict[str, Any]:
+        """Get metrics formatted for monitoring endpoints (Prometheus, JSON, etc.)."""
+        total_requests = self.stats["hits"] + self.stats["misses"]
+        hit_rate = self.stats["hits"] / total_requests if total_requests > 0 else 0.0
+        
+        # Calculate tier distribution
+        tier_dist = {}
+        effort_dist = {}
+        spec_dist = {}
+        for p in self._pool.values():
+            tier_dist[p.spec.tier.value] = tier_dist.get(p.spec.tier.value, 0) + 1
+            effort_dist[p.spec.effort.value] = effort_dist.get(p.spec.effort.value, 0) + 1
+            spec_dist[p.spec.specialization] = spec_dist.get(p.spec.specialization, 0) + 1
+
+        return {
+            # Core metrics
+            "pool_size": len(self._pool),
+            "pool_max_size": self.max_size,
+            "pool_utilization": len(self._pool) / self.max_size if self.max_size > 0 else 0.0,
+            
+            # Request metrics
+            "total_requests": total_requests,
+            "cache_hits": self.stats["hits"],
+            "cache_misses": self.stats["misses"],
+            "hit_rate": hit_rate,
+            
+            # Lifecycle metrics
+            "creations": self.stats["creations"],
+            "evictions": self.stats["evictions"],
+            "expired": self.stats["expired"],
+            
+            # Distribution metrics
+            "tier_distribution": tier_dist,
+            "effort_distribution": effort_dist,
+            "specialization_distribution": spec_dist,
+            
+            # Per-subagent details
+            "subagents": [
+                {
+                    "tier": p.spec.tier.value,
+                    "effort": p.spec.effort.value,
+                    "specialization": p.spec.specialization,
+                    "context_hash": p.spec.context_hash[:8],
+                    "use_count": p.use_count,
+                    "age_seconds": round(p.age_seconds, 2),
+                    "idle_seconds": round(p.idle_seconds, 2),
+                    "ttl_remaining": round(
+                        self.ttl_by_tier.get(p.spec.tier.value, 600) - p.idle_seconds, 2
+                    ),
+                }
+                for p in self._pool.values()
+            ],
+            
+            # Timestamp
+            "timestamp": time.time(),
+        }
+
+
 # Global pool instance (initialized by orchestrator)
 _global_pool: Optional["SubagentPool"] = None
 
@@ -378,3 +436,30 @@ def shutdown_global_pool() -> None:
     if _global_pool:
         # Note: caller must await this in async context
         _global_pool = None
+
+
+def get_pool_metrics() -> dict[str, Any]:
+    """Get metrics from the global pool for monitoring endpoints.
+    
+    Returns empty dict if pool not initialized.
+    """
+    pool = get_global_pool()
+    if pool:
+        return pool.get_metrics_endpoint()
+    return {
+        "pool_size": 0,
+        "pool_max_size": 0,
+        "pool_utilization": 0.0,
+        "total_requests": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "hit_rate": 0.0,
+        "creations": 0,
+        "evictions": 0,
+        "expired": 0,
+        "tier_distribution": {},
+        "effort_distribution": {},
+        "specialization_distribution": {},
+        "subagents": [],
+        "timestamp": time.time(),
+    }
