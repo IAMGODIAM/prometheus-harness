@@ -533,8 +533,11 @@ class Orchestrator:
         self._kill_switch = False
 
         # P0: Provider factory for tier/effort-based delegation
-        # If llm_client is provided, use it as the base provider for the factory
-        self.provider_factory = ProviderFactory()
+        # If the top-level client is MockProvider, force mock for all pool builds
+        # so --mock harness runs never require NVIDIA_API_KEY.
+        from prometheus.harness.model_client import MockProvider as _MockProvider
+        force_mock = isinstance(llm_client, _MockProvider)
+        self.provider_factory = ProviderFactory(force_mock=force_mock)
 
         # Store the base llm_client for fallback
         self._base_llm_client = llm_client
@@ -602,6 +605,12 @@ class Orchestrator:
         Returns:
             Configured AgentLoop instance.
         """
+        # Coerce string tier/effort (CLI / harness may pass bare strings)
+        if isinstance(subagent_tier, str):
+            subagent_tier = SubagentTier(subagent_tier)
+        if isinstance(subagent_effort, str):
+            subagent_effort = EffortLevel(subagent_effort)
+
         # Determine tier/effort from role if not specified
         if subagent_tier is None:
             if role in (AgentRole.EXPLORER, AgentRole.REVIEWER, AgentRole.TESTER):

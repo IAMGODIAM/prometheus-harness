@@ -390,8 +390,13 @@ class MockProvider(ModelProvider):
 class ProviderFactory:
     """Factory for building providers from tier/effort or env."""
 
-    def __init__(self):
+    def __init__(self, force_mock: bool = False):
         self._provider_cache: dict[tuple[SubagentTier, EffortLevel], ModelProvider] = {}
+        # When True (or PROMETHEUS_LLM_PROVIDER=mock), all tier builds return MockProvider.
+        # Required so --mock harness runs don't spawn real NVIDIA providers via the pool.
+        self.force_mock = force_mock or (
+            os.environ.get("PROMETHEUS_LLM_PROVIDER", "").lower() == "mock"
+        )
 
     def build_from_tier_effort(
         self,
@@ -400,9 +405,20 @@ class ProviderFactory:
         api_key_env: str = "NVIDIA_API_KEY",
     ) -> ModelProvider:
         """Build provider from tier/effort config."""
+        # Coerce string inputs (CLI / JSON callers often pass bare strings)
+        if isinstance(tier, str):
+            tier = SubagentTier(tier)
+        if isinstance(effort, str):
+            effort = EffortLevel(effort)
+
         cache_key = (tier, effort)
         if cache_key in self._provider_cache:
             return self._provider_cache[cache_key]
+
+        if self.force_mock:
+            provider = MockProvider()
+            self._provider_cache[cache_key] = provider
+            return provider
 
         config = get_tier_config(tier, effort)
         provider = OpenAICompatibleProvider(
@@ -419,7 +435,7 @@ class ProviderFactory:
     def build_from_env(self) -> ModelProvider:
         """Construct a provider from environment variables (legacy)."""
         provider = os.environ.get("PROMETHEUS_LLM_PROVIDER", "openai").lower()
-        if provider == "mock":
+        if provider == "mock" or self.force_mock:
             return MockProvider()
         base_url = os.environ.get("PROMETHEUS_LLM_BASE_URL", NVIDIA_DEFAULT_BASE_URL)
         model_id = os.environ.get("PROMETHEUS_LLM_MODEL", DEFAULT_MODEL_ID)
