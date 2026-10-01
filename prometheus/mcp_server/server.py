@@ -156,7 +156,6 @@ def create_jlens_server(
 
     server = FastMCP(
         name="prometheus-jlens",
-        description="J-Lens interpretability spine — probe, decompose, and monitor model internals",
     )
 
     @server.tool(

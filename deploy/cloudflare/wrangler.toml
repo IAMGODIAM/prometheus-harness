@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 ENVIRONMENT = "production"
 
-# Durable Objects for session state
+# Durable Objects for session state (SQLite-backed per Cloudflare requirement)
 [[durable_objects.bindings]]
 name = "SESSION_STATE"
 class_name = "SessionState"
@@ -14,7 +14,7 @@ class_name = "SessionState"
 # KV for lens storage
 [[kv_namespaces]]
 binding = "LENS_STORE"
-id = "placeholder_id"
+id = "e6b16cba2576427a9fb7d5f51bb2c2fb"
 
 # R2 for large model artifacts
 [[r2_buckets]]
@@ -30,4 +30,9 @@ command = "npm run build"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["SessionState"]
+new_sqlite_classes = ["SessionState"]
+
+# Custom domain route
+[[routes]]
+pattern = "prometheus.e5enclave.com/mcp*"
+zone_name = "e5enclave.com"
