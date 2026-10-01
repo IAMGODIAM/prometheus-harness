@@ -100,7 +100,14 @@ class RealJLensGate:
             effort = data.get("subagent_effort")
 
             logits = self._scorer(text)
-            scores = self._watchlist.score(logits, self._tokenizer)
+            # Scorer may return a single tensor or a dict[layer -> tensor]
+            if isinstance(logits, dict):
+                batch = self._watchlist.score_batch(logits, self._tokenizer)
+                scores = []
+                for layer_scores in batch.values():
+                    scores.extend(layer_scores)
+            else:
+                scores = self._watchlist.score(logits, self._tokenizer)
 
             # Apply delegation-specific categories if in delegation context
             if is_delegation and tier and effort:
@@ -130,7 +137,7 @@ class RealJLensGate:
         Thresholds vary by tier/effort — larger tiers get stricter thresholds
         because they have more capability and thus more risk.
         """
-        from prometheus.jlens.watchlist import WatchlistScore  # type: ignore
+        from prometheus.jlens.watchlist import WatchlistScores
 
         # Tier/effort threshold multipliers
         tier_multiplier = {"small": 1.0, "standard": 0.8, "large": 0.6}
@@ -144,12 +151,19 @@ class RealJLensGate:
             # Simple token matching (real implementation uses watchlist.score)
             triggered = any(token in text.lower() for token in cat_config["tokens"])
             max_score = 1.0 if triggered else 0.0
+            token_scores = {
+                token: (1.0 if token in text.lower() else 0.0)
+                for token in cat_config["tokens"]
+            }
 
-            scores.append(WatchlistScore(
+            scores.append(WatchlistScores(
                 category=cat_name,
+                token_scores=token_scores,
                 max_score=max_score,
+                mean_score=sum(token_scores.values()) / max(len(token_scores), 1),
+                triggered=triggered and max_score > threshold,
                 threshold=threshold,
-                top_tokens=cat_config["tokens"] if triggered else [],
+                details={"tier": tier, "effort": effort},
             ))
         return scores
 

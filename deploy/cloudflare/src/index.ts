@@ -3,7 +3,7 @@
  *
  * This Worker acts as a Streamable HTTP transport for the Prometheus MCP server.
  * It handles:
- * 1. MCP protocol messages (JSON-RPC over HTTP)
+ * 1. MCP protocol messages (JSON-RPC over HTTP with SSE)
  * 2. Session management via Durable Objects
  * 3. Authentication and rate limiting
  * 4. Edge-side watchlist pre-screening (lightweight J-lens heuristic)
@@ -35,6 +35,9 @@ interface MCPResponse {
   result?: unknown;
   error?: { code: number; message: string; data?: unknown };
 }
+
+// Session map: client session ID -> upstream session ID
+const sessionMap = new Map<string, string>();
 
 // Edge-side watchlist keywords for pre-screening
 const EDGE_WATCHLIST: Record<string, string[]> = {
@@ -72,25 +75,66 @@ function edgeWatchlistCheck(content: string): Record<string, number> {
   return scores;
 }
 
+async function getOrCreateUpstreamSession(clientSessionId: string, upstreamUrl: string): Promise<string> {
+  // Check if we already have an upstream session for this client
+  if (sessionMap.has(clientSessionId)) {
+    return sessionMap.get(clientSessionId)!;
+  }
+
+  // Create new session with upstream
+  const initResponse = await fetch(upstreamUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "prometheus-mcp-worker", version: "0.1.0" },
+      },
+    }),
+  });
+
+  const sessionId = initResponse.headers.get("mcp-session-id");
+  if (!sessionId) {
+    throw new Error("Upstream did not return session ID");
+  }
+
+  sessionMap.set(clientSessionId, sessionId);
+  return sessionId;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    // Route pattern is prometheus.e5enclave.com/mcp* so paths arrive as
+    // /mcp, /mcp/, /mcp/health, /mcp/tools. Also support bare /health|/tools
+    // on workers.dev direct hostnames.
+    const path = url.pathname.replace(/\/+$/, "") || "/";
+    const isHealth = path === "/health" || path === "/mcp/health";
+    const isTools = path === "/tools" || path === "/mcp/tools";
+    const isMcp = path === "/mcp" || path === "/";
 
     // Health check
-    if (url.pathname === "/health") {
+    if (isHealth) {
       return new Response(JSON.stringify({ status: "ok", service: "prometheus-mcp" }), {
         headers: { "Content-Type": "application/json" },
       });
     }
 
-    // MCP endpoint
-    if (url.pathname === "/mcp" || url.pathname === "/mcp/") {
-      return handleMCP(request, env);
+    // Tool listing (convenience)
+    if (isTools) {
+      return handleToolList(env);
     }
 
-    // Tool listing (convenience)
-    if (url.pathname === "/tools") {
-      return handleToolList(env);
+    // MCP endpoint
+    if (isMcp) {
+      return handleMCP(request, env);
     }
 
     return new Response("Not Found", { status: 404 });
@@ -115,6 +159,13 @@ async function handleMCP(request: Request, env: Env): Promise<Response> {
     });
   }
 
+  // Get or create client session ID
+  let clientSessionId = request.headers.get("Mcp-Session-Id");
+  if (!clientSessionId) {
+    // Generate a new session ID for this client
+    clientSessionId = crypto.randomUUID();
+  }
+
   // Parse MCP request
   let mcpRequest: MCPRequest;
   try {
@@ -125,6 +176,55 @@ async function handleMCP(request: Request, env: Env): Promise<Response> {
       { status: 400, headers: { "Content-Type": "application/json" } }
     );
   }
+
+  // Handle initialize separately (creates session)
+  if (mcpRequest.method === "initialize") {
+    const upstreamUrl = env.PROMETHEUS_UPSTREAM_URL || "http://localhost:8084/mcp";
+
+    try {
+      const upstreamResponse = await fetch(upstreamUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json, text/event-stream",
+        },
+        body: JSON.stringify(mcpRequest),
+      });
+
+      // Forward the response with session ID header
+      const responseHeaders = new Headers();
+      responseHeaders.set("Content-Type", "text/event-stream");
+      responseHeaders.set("Cache-Control", "no-cache, no-transform");
+      responseHeaders.set("X-Prometheus-Edge", "cloudflare");
+
+      const upstreamSessionId = upstreamResponse.headers.get("mcp-session-id");
+      if (upstreamSessionId) {
+        sessionMap.set(clientSessionId, upstreamSessionId);
+        responseHeaders.set("Mcp-Session-Id", clientSessionId);
+      }
+
+      return new Response(upstreamResponse.body, {
+        status: 200,
+        headers: responseHeaders,
+      });
+    } catch (error) {
+      const response: MCPResponse = {
+        jsonrpc: "2.0",
+        id: mcpRequest.id,
+        error: {
+          code: -32603,
+          message: `Upstream error: ${error instanceof Error ? error.message : "unknown"}`,
+        },
+      };
+      return new Response(JSON.stringify(response), {
+        status: 502,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+  }
+
+  // For other methods, get upstream session and forward
+  const upstreamUrl = env.PROMETHEUS_UPSTREAM_URL || "http://localhost:8084/mcp";
 
   // Edge-side pre-screening for tool calls
   if (mcpRequest.method === "tools/call") {
@@ -154,29 +254,31 @@ async function handleMCP(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  // Forward to upstream Prometheus server
-  const upstreamUrl = env.PROMETHEUS_UPSTREAM_URL || "http://localhost:8080/mcp";
-
   try {
+    const upstreamSessionId = await getOrCreateUpstreamSession(clientSessionId, upstreamUrl);
+
     const upstreamResponse = await fetch(upstreamUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-Prometheus-Session": request.headers.get("X-Session-ID") || "default",
+        "Accept": "application/json, text/event-stream",
+        "Mcp-Session-Id": upstreamSessionId,
         "X-Forwarded-For": request.headers.get("CF-Connecting-IP") || "unknown",
       },
       body: JSON.stringify(mcpRequest),
     });
 
-    const result = await upstreamResponse.json();
+    // Forward response with our session ID
+    const responseHeaders = new Headers();
+    const contentType = upstreamResponse.headers.get("Content-Type") || "application/json";
+    responseHeaders.set("Content-Type", contentType);
+    responseHeaders.set("Cache-Control", "no-cache, no-transform");
+    responseHeaders.set("X-Prometheus-Edge", "cloudflare");
+    responseHeaders.set("Mcp-Session-Id", clientSessionId);
 
-    return new Response(JSON.stringify(result), {
-      status: 200,
-      headers: {
-        "Content-Type": "application/json",
-        "X-Prometheus-Edge": "cloudflare",
-        "X-Watchlist-Checked": "true",
-      },
+    return new Response(upstreamResponse.body, {
+      status: upstreamResponse.status,
+      headers: responseHeaders,
     });
   } catch (error) {
     const response: MCPResponse = {

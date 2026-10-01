@@ -157,3 +157,25 @@ d3b1cff Deploy: Prometheus MCP Worker to Cloudflare with KV, R2, Durable Objects
 - **Lens fitting will complete** - then Real Gate can be wired and tested
 - **All code committed and pushed** - no local-only changes
 - **Bridge coordination** - Sarah onboarded, issues #4 #5 open for Atlas
+
+
+## LIVE CHAIN VERIFIED (2026-10-01 03:19 UTC)
+
+| Hop | Status | Evidence |
+|-----|--------|----------|
+| Local MCP `:8084` | ✅ | initialize → `prometheus-jlens` |
+| Dedicated tunnel `prometheus-upstream` | ✅ | `50a1c596-...` → `prometheus-up.e5enclave.com` |
+| Upstream public | ✅ | initialize SSE + `mcp-session-id` |
+| Worker edge `prometheus.e5enclave.com/mcp*` | ✅ | `/mcp/health` OK, `/mcp/tools` OK |
+| Worker → upstream full chain | ✅ | initialize + tools/list returns jlens_* tools |
+
+### Real J-Lens Gate
+- Fitted `lens.pt` (GPT-2, 8 samples)
+- Fixed `WatchlistScores` import + multi-layer scorer path
+- Delegation attack blocked: `exfiltrate/sudo/bypass` → DENY
+
+### Tunnel Ops
+- Shared mesh tunnel still on Windows connector (boardroom/etc)
+- Sandbox runs **dedicated** `prometheus-upstream` only (avoids Windows LB miss on :8084)
+- Token runner: `~/.hermes/cache/scratch/run-prom-up-tunnel.sh`
+
