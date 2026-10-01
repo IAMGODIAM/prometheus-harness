@@ -425,7 +425,65 @@ async def cmd_serve(args: argparse.Namespace, config: HarnessConfig) -> None:
     # JSON-RPC stream and any stray print corrupts MCP framing.
     print(f"Starting Prometheus MCP server ({args.transport} transport)", file=sys.stderr)
 
-    server = create_jlens_server(enable_steering=config.jlens.enable_steering)
+    model_registry = None
+    lens_registry = None
+
+    # Optional model/lens loading for live tool calls (not just protocol smoke).
+    if getattr(args, "model", None):
+        try:
+            from prometheus.jlens.model_adapter import ModelAdapter
+
+            class _ModelRegistry:
+                def __init__(self, default_id: str, adapter: Any):
+                    self._default = default_id
+                    self._models = {default_id: adapter}
+
+                def get(self, model_id: str | None = None) -> Any:
+                    if model_id and model_id in self._models:
+                        return self._models[model_id]
+                    return self._models[self._default]
+
+                def get_default(self) -> Any:
+                    return self._models[self._default]
+
+            print(f"Loading model: {args.model}", file=sys.stderr)
+            adapter = ModelAdapter.from_pretrained(args.model, device="cpu")
+            model_registry = _ModelRegistry(args.model, adapter)
+            print(f"Model loaded: {args.model} ({adapter.n_layers} layers)", file=sys.stderr)
+        except Exception as e:
+            print(f"WARNING: failed to load model {args.model}: {e}", file=sys.stderr)
+
+    if getattr(args, "lens", None):
+        try:
+            from prometheus.jlens.lens import JacobianLens
+
+            class _LensRegistry:
+                def __init__(self, lens_id: str, lens: Any, model_id: str | None = None):
+                    self._latest = lens_id
+                    self._model_id = model_id
+                    self._lenses = {lens_id: lens}
+
+                def get(self, lens_id: str | None = None) -> Any:
+                    if lens_id and lens_id in self._lenses:
+                        return self._lenses[lens_id]
+                    return self._lenses[self._latest]
+
+                def get_latest(self, model_id: str | None = None) -> Any:
+                    return self._lenses[self._latest]
+
+            print(f"Loading lens: {args.lens}", file=sys.stderr)
+            lens = JacobianLens.load(args.lens)
+            lens_id = getattr(lens, "lens_id", None) or Path(args.lens).stem
+            lens_registry = _LensRegistry(lens_id, lens, getattr(args, "model", None))
+            print(f"Lens loaded: {lens_id}", file=sys.stderr)
+        except Exception as e:
+            print(f"WARNING: failed to load lens {args.lens}: {e}", file=sys.stderr)
+
+    server = create_jlens_server(
+        lens_registry=lens_registry,
+        model_registry=model_registry,
+        enable_steering=config.jlens.enable_steering,
+    )
 
     if args.transport == "stdio":
         print("Listening on stdio...", file=sys.stderr)
